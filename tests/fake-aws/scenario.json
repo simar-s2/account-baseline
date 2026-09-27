@@ -1,0 +1,21 @@
+{
+  "account_id": "111122223333",
+  "configured_region": "us-east-1",
+  "regions": {
+    "us-east-1": {
+      "nat_route_tables": ["rtb-0a1b2c3d4e5f60001"],
+      "private_subnets": ["subnet-0a1b2c3d4e5f60011", "subnet-0a1b2c3d4e5f60012"],
+      "default_vpc": "vpc-0a1b2c3d4e5f60021",
+      "network_interfaces": 0,
+      "internet_gateway": "igw-0a1b2c3d4e5f60031",
+      "subnets": ["subnet-0a1b2c3d4e5f60041", "subnet-0a1b2c3d4e5f60042"]
+    },
+    "us-west-2": {
+      "nat_route_tables": [],
+      "default_vpc": "vpc-0a1b2c3d4e5f60051",
+      "network_interfaces": 3,
+      "internet_gateway": "igw-0a1b2c3d4e5f60061",
+      "subnets": ["subnet-0a1b2c3d4e5f60071"]
+    }
+  }
+}
