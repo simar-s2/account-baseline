@@ -1,0 +1,228 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  account-baseline: account and region security settings checked by Security
+  Hub (FSBP). Deploy one stack per region. The stack in HomeRegion also applies
+  the account-wide settings. Deleting the stack leaves the settings in place.
+
+Parameters:
+  HomeRegion:
+    Type: String
+    Default: us-east-1
+    Description: Region whose stack applies the account-wide settings (S3 Block Public Access, password policy, alternate contacts).
+  MinimumPasswordLength:
+    Type: Number
+    Default: 14
+    MinValue: 8
+    MaxValue: 128
+  PasswordReusePrevention:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 24
+  SnapshotBlockPublicAccess:
+    Type: String
+    Default: block-all-sharing
+    AllowedValues: [block-all-sharing, block-new-sharing]
+  VpcBlockPublicAccess:
+    Type: String
+    Default: 'off'
+    AllowedValues: ['off', block-ingress, block-bidirectional]
+    Description: Off by default because it also blocks intentionally public load balancers.
+  ContactEmail:
+    Type: String
+    Default: ''
+    Description: Alternate contact for BILLING, OPERATIONS and SECURITY. Empty leaves contacts unchanged.
+  ContactName:
+    Type: String
+    Default: Security team
+  ContactPhone:
+    Type: String
+    Default: ''
+
+Rules:
+  ContactNeedsPhone:
+    RuleCondition: !Not [!Equals [!Ref ContactEmail, '']]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref ContactPhone, '']]
+        AssertDescription: ContactPhone is required when ContactEmail is set.
+
+Conditions:
+  IsHomeRegion: !Equals [!Ref 'AWS::Region', !Ref HomeRegion]
+  BlockVpcPublicAccess: !Not [!Equals [!Ref VpcBlockPublicAccess, 'off']]
+
+Resources:
+
+  # ---------------- Native resources ----------------
+
+  # EC2.182
+  SnapshotBlockPublicAccessSetting:
+    Type: AWS::EC2::SnapshotBlockPublicAccess
+    Properties:
+      State: !Ref SnapshotBlockPublicAccess
+
+  # SSM.7
+  SsmDocumentPublicSharing:
+    Type: AWS::SSM::ServiceSetting
+    Properties:
+      SettingId: /ssm/documents/console/public-sharing-permission
+      SettingValue: Disable
+
+  # SSM.6
+  SsmAutomationLogging:
+    Type: AWS::SSM::ServiceSetting
+    Properties:
+      SettingId: /ssm/automation/customer-script-log-destination
+      SettingValue: CloudWatch
+
+  # EC2.172
+  VpcBlockPublicAccessOptions:
+    Type: AWS::EC2::VPCBlockPublicAccessOptions
+    Condition: BlockVpcPublicAccess
+    Properties:
+      InternetGatewayBlockMode: !Ref VpcBlockPublicAccess
+
+  # ---------------- Settings with no CloudFormation resource ----------------
+  # EBS encryption by default, account-level S3 Block Public Access, the IAM
+  # password policy and alternate contacts are applied by a small custom
+  # resource. On delete it leaves them on: removing the stack must not weaken
+  # the account.
+
+  SettingsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: Holds only the function's own status lines; the default service encryption is enough.
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-settings'
+      RetentionInDays: 90
+
+  SettingsFunctionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: These account-level APIs have no resource ARN, so the policy must use '*'.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: apply-account-settings
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:EnableEbsEncryptionByDefault
+                  - s3:PutAccountPublicAccessBlock
+                  - iam:UpdateAccountPasswordPolicy
+                  - account:PutAlternateContact
+                Resource: '*'
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt SettingsLogGroup.Arn
+
+  SettingsFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: Reserved concurrency fails in new accounts whose concurrency quota is still at the minimum.
+          - id: CKV_AWS_116
+            comment: Invoked synchronously by CloudFormation, which reports failures itself.
+          - id: CKV_AWS_117
+            comment: Calls only AWS APIs; a VPC would add NAT or endpoint costs for no benefit.
+          - id: CKV_AWS_173
+            comment: The function has no environment variables.
+    Properties:
+      Description: Applies account settings that have no CloudFormation resource.
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt SettingsFunctionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref SettingsLogGroup
+      Code:
+        ZipFile: |
+          import json, urllib.request
+          import boto3
+
+          def respond(event, context, status, reason=''):
+              # Stdlib response, so the function does not depend on the
+              # cfn-response helper being available in the runtime.
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or 'See log stream ' + context.log_stream_name,
+                  'PhysicalResourceId': event.get('PhysicalResourceId') or event['LogicalResourceId'],
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+              }).encode()
+              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT',
+                                           headers={'content-type': ''})
+              urllib.request.urlopen(req, timeout=30)
+
+          def apply(props, account_id):
+              if props.get('EbsEncryptionByDefault') == 'true':
+                  boto3.client('ec2').enable_ebs_encryption_by_default()
+              if props.get('S3BlockPublicAccess') == 'true':
+                  boto3.client('s3control').put_public_access_block(
+                      AccountId=account_id,
+                      PublicAccessBlockConfiguration={
+                          'BlockPublicAcls': True, 'IgnorePublicAcls': True,
+                          'BlockPublicPolicy': True, 'RestrictPublicBuckets': True})
+              if props.get('MinimumPasswordLength'):
+                  boto3.client('iam').update_account_password_policy(
+                      MinimumPasswordLength=int(props['MinimumPasswordLength']),
+                      PasswordReusePrevention=int(props['PasswordReusePrevention']),
+                      RequireSymbols=True, RequireNumbers=True,
+                      RequireUppercaseCharacters=True, RequireLowercaseCharacters=True,
+                      AllowUsersToChangePassword=True)
+              if props.get('ContactEmail'):
+                  account = boto3.client('account')
+                  for kind in ('BILLING', 'OPERATIONS', 'SECURITY'):
+                      account.put_alternate_contact(
+                          AlternateContactType=kind, Name=props['ContactName'],
+                          Title=props['ContactName'], EmailAddress=props['ContactEmail'],
+                          PhoneNumber=props['ContactPhone'])
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ('Create', 'Update'):
+                      apply(event['ResourceProperties'], event['StackId'].split(':')[4])
+                  respond(event, context, 'SUCCESS')
+              except Exception as e:
+                  print('ERROR:', e)
+                  respond(event, context, 'FAILED', str(e)[:500])
+
+  # EC2.7
+  RegionalSettings:
+    Type: Custom::RegionalSettings
+    Properties:
+      ServiceToken: !GetAtt SettingsFunction.Arn
+      EbsEncryptionByDefault: 'true'
+
+  # S3.1, IAM.7, Account.1
+  AccountSettings:
+    Type: Custom::AccountSettings
+    Condition: IsHomeRegion
+    Properties:
+      ServiceToken: !GetAtt SettingsFunction.Arn
+      S3BlockPublicAccess: 'true'
+      MinimumPasswordLength: !Ref MinimumPasswordLength
+      PasswordReusePrevention: !Ref PasswordReusePrevention
+      ContactEmail: !Ref ContactEmail
+      ContactName: !Ref ContactName
+      ContactPhone: !Ref ContactPhone
+
+Outputs:
+  AccountSettingsApplied:
+    Description: Whether this stack applied the account-wide settings.
+    Value: !If [IsHomeRegion, 'true', 'false']
