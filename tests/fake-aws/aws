@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fake `aws` CLI for the tests and `make demo`.
 
-Answers the read-only calls account-baseline.sh makes from a scenario file,
+Answers the read-only calls the scripts make from a scenario file,
 accepts every write, and appends each call to $FAKE_AWS_LOG as a JSON line.
 No request ever leaves the machine.
 """
@@ -47,6 +47,16 @@ def answer(scenario, opts, rest):
         return region.get("internet_gateway") or "None"
     if (service, op) == ("ec2", "describe-subnets"):
         return "\t".join(region.get("subnets", []))
+    if (service, op) == ("cloudformation", "describe-stack-set"):
+        if not scenario.get("stack_set_exists"):
+            sys.stderr.write("StackSetNotFoundException\n")
+            sys.exit(254)
+        return "{}"
+    if (service, op) in (("cloudformation", "update-stack-set"),
+                         ("cloudformation", "create-stack-instances")):
+        return "op-0001"
+    if (service, op) == ("cloudformation", "describe-stack-set-operation"):
+        return "SUCCEEDED"
     return ""  # a write: accept it
 
 
